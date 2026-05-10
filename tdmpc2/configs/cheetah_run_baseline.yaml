@@ -26,6 +26,6 @@ batch_size: 128
 num_samples: 256
 num_elites: 32
 num_pi_trajs: 12
-compile: true
+compile: false
 save_video: false
 save_agent: false

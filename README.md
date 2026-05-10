@@ -1,4 +1,4 @@
-# AD-MPC2: Adaptive-Horizon with TD-MPC2 Extension
+# AD-MPC2: TD-MPC2 with Adaptive Horizon
 
 Read `experiments.ipynb` for reproducing our experiments.
 

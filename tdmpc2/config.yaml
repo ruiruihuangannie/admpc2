@@ -1,8 +1,8 @@
-defaults:
-    - override hydra/launcher: submitit_local
+# defaults:
+    # - override hydra/launcher: submitit_local
 
 # environment
-task: dog-run
+# task: dog-run
 obs: state
 episodic: false
 
@@ -28,7 +28,7 @@ discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1_000_000
 exp_name: default
-data_dir: ???
+# data_dir: ???
 
 # planning
 mpc: true
@@ -37,6 +37,11 @@ num_samples: 512
 num_elites: 64
 num_pi_trajs: 24
 horizon: 3
+adaptive_horizon: false
+h_min: 1
+h_max: 5
+inconsistency_threshold: 1.0
+inconsistency_patience: 1
 min_std: 0.05
 max_std: 2
 temperature: 0.5
@@ -45,6 +50,7 @@ temperature: 0.5
 log_std_min: -10
 log_std_max: 2
 entropy_coef: 1e-4
+behavior_reg_coef: 0
 
 # critic
 num_bins: 101
@@ -52,7 +58,7 @@ vmin: -10
 vmax: +10
 
 # architecture
-model_size: ???
+# model_size: ???
 num_enc_layers: 2
 enc_dim: 256
 num_channels: 32
@@ -64,8 +70,7 @@ dropout: 0.01
 simnorm_dim: 8
 
 # logging
-wandb_project: ???
-wandb_entity: ???
+wandb_entity: ahrr-ai4s
 wandb_silent: false
 enable_wandb: true
 save_csv: true

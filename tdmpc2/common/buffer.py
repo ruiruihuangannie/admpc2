@@ -22,7 +22,8 @@ class Buffer():
 			strict_length=True,
 			cache_values=cfg.multitask,
 		)
-		self._batch_size = cfg.batch_size * (cfg.horizon+1)
+		self._horizon = cfg.h_max if cfg.adaptive_horizon else cfg.horizon
+		self._batch_size = cfg.batch_size * (self._horizon+1)
 		self._num_eps = 0
 
 	@property
@@ -111,5 +112,5 @@ class Buffer():
 
 	def sample(self):
 		"""Sample a batch of subsequences from the buffer."""
-		td = self._buffer.sample().view(-1, self.cfg.horizon+1).permute(1, 0)
+		td = self._buffer.sample().view(-1, self._horizon+1).permute(1, 0)
 		return self._prepare_batch(td)

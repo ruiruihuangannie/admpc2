@@ -59,7 +59,7 @@ def make_env(cfg):
 	"""
 	Make an environment for TD-MPC2 experiments.
 	"""
-	gym.logger.set_level(40)
+	# gym.logger.set_level(40)
 	if cfg.multitask:
 		env = make_multitask_env(cfg)
 
@@ -78,6 +78,6 @@ def make_env(cfg):
 	except: # Box
 		cfg.obs_shape = {cfg.get('obs', 'state'): env.observation_space.shape}
 	cfg.action_dim = env.action_space.shape[0]
-	cfg.episode_length = env.max_episode_steps
+	cfg.episode_length = env.get_wrapper_attr('max_episode_steps')
 	cfg.seed_steps = max(1000, 5*cfg.episode_length)
 	return env

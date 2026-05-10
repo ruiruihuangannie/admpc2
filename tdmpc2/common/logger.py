@@ -15,7 +15,6 @@ CONSOLE_FORMAT = [
 	("episode", "E", "int"),
 	("step", "I", "int"),
 	("episode_reward", "R", "float"),
-	("episode_success", "S", "float"),
 	("elapsed_time", "T", "time"),
 ]
 
@@ -117,7 +116,10 @@ class Logger:
 		print_run(cfg)
 		self.project = cfg.get("wandb_project", "none")
 		self.entity = cfg.get("wandb_entity", "none")
-		if not cfg.enable_wandb or self.project == "none" or self.entity == "none":
+		if self.entity in {"none", "???"}:
+			self.entity = None
+		self.name = cfg.get("wandb_run_name", str(cfg.seed))
+		if not cfg.enable_wandb or self.project in {"none", "???"}:
 			print(colored("Wandb disabled.", "blue", attrs=["bold"]))
 			cfg.save_agent = False
 			cfg.save_video = False
@@ -127,15 +129,17 @@ class Logger:
 		os.environ["WANDB_SILENT"] = "true" if cfg.wandb_silent else "false"
 		import wandb
 
-		wandb.init(
+		init_kwargs = dict(
 			project=self.project,
-			entity=self.entity,
-			name=str(cfg.seed),
+			name=self.name,
 			group=self._group,
 			tags=cfg_to_group(cfg, return_list=True) + [f"seed:{cfg.seed}"],
 			dir=self._log_dir,
 			config=dataclasses.asdict(cfg),
 		)
+		if self.entity is not None:
+			init_kwargs["entity"] = self.entity
+		wandb.init(**init_kwargs)
 		print(colored("Logs will be synced with wandb.", "blue", attrs=["bold"]))
 		self._wandb = wandb
 		self._video = (

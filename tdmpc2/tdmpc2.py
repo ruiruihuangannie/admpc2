@@ -38,8 +38,12 @@ class TDMPC2(torch.nn.Module):
 		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
-		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
-		if cfg.compile:
+		self._prev_mean = torch.nn.Buffer(torch.zeros(self._rollout_horizon, self.cfg.action_dim, device=self.device))
+		self._last_plan_horizon = torch.nn.Buffer(torch.tensor(float(self.cfg.horizon), device=self.device))
+		self._compile = cfg.compile and not cfg.adaptive_horizon
+		if cfg.compile and cfg.adaptive_horizon:
+			print('Disabling torch.compile because adaptive_horizon=true uses dynamic horizon selection.')
+		if self._compile:
 			print('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
 
@@ -48,7 +52,7 @@ class TDMPC2(torch.nn.Module):
 		_plan_val = getattr(self, "_plan_val", None)
 		if _plan_val is not None:
 			return _plan_val
-		if self.cfg.compile:
+		if self._compile:
 			plan = torch.compile(self._plan, mode="reduce-overhead")
 		else:
 			plan = self._plan
@@ -69,6 +73,29 @@ class TDMPC2(torch.nn.Module):
 		"""
 		frac = episode_length/self.cfg.discount_denom
 		return min(max((frac-1)/(frac), self.cfg.discount_min), self.cfg.discount_max)
+
+	@property
+	def _rollout_horizon(self):
+		return self.cfg.h_max if self.cfg.adaptive_horizon else self.cfg.horizon
+
+	def _select_horizon(self, depth_returns):
+		"""Select rollout horizon from model-value inconsistency statistics."""
+		if not self.cfg.adaptive_horizon:
+			return self.cfg.horizon, {}
+		depth_return_values = tuple(depth_returns.values())
+		return_mean = torch.stack(depth_return_values).mean(dim=0)
+		stats = {
+			depth: (depth_return - return_mean).abs().mean()
+			for depth, depth_return in depth_returns.items()
+		}
+		candidates = {
+			depth: inconsistency
+			for depth, inconsistency in stats.items()
+			if self.cfg.h_min <= depth <= self.cfg.h_max
+		}
+		selected = min(candidates, key=candidates.get)
+		selected = min(max(selected, self.cfg.h_min), self.cfg.h_max)
+		return selected, stats
 
 	def save(self, fp):
 		"""
@@ -123,9 +150,11 @@ class TDMPC2(torch.nn.Module):
 	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
 		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
+		horizon = self._rollout_horizon
 		G, discount = 0, 1
 		termination = torch.zeros(self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
-		for t in range(self.cfg.horizon):
+		depth_returns = {}
+		for t in range(horizon):
 			reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
 			z = self.model.next(z, actions[t], task)
 			G = G + discount * (1-termination) * reward
@@ -133,6 +162,14 @@ class TDMPC2(torch.nn.Module):
 			discount = discount * discount_update
 			if self.cfg.episodic:
 				termination = torch.clip(termination + (self.model.termination(z, task) > 0.5).float(), max=1.)
+			depth = t + 1
+			if self.cfg.adaptive_horizon and depth in (1, 3, 5, horizon):
+				action, _ = self.model.pi(z, task)
+				depth_returns[depth] = G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
+		if self.cfg.adaptive_horizon:
+			horizon, _ = self._select_horizon(depth_returns)
+			self._last_plan_horizon.fill_(float(horizon))
+			return depth_returns[horizon]
 		action, _ = self.model.pi(z, task)
 		return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
 
@@ -151,22 +188,23 @@ class TDMPC2(torch.nn.Module):
 			torch.Tensor: Action to take in the environment.
 		"""
 		# Sample policy trajectories
+		horizon = self._rollout_horizon
 		z = self.model.encode(obs, task)
 		if self.cfg.num_pi_trajs > 0:
-			pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
+			pi_actions = torch.empty(horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 			_z = z.repeat(self.cfg.num_pi_trajs, 1)
-			for t in range(self.cfg.horizon-1):
+			for t in range(horizon-1):
 				pi_actions[t], _ = self.model.pi(_z, task)
 				_z = self.model.next(_z, pi_actions[t], task)
 			pi_actions[-1], _ = self.model.pi(_z, task)
 
 		# Initialize state and parameters
 		z = z.repeat(self.cfg.num_samples, 1)
-		mean = torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device)
-		std = torch.full((self.cfg.horizon, self.cfg.action_dim), self.cfg.max_std, dtype=torch.float, device=self.device)
+		mean = torch.zeros(horizon, self.cfg.action_dim, device=self.device)
+		std = torch.full((horizon, self.cfg.action_dim), self.cfg.max_std, dtype=torch.float, device=self.device)
 		if not t0:
 			mean[:-1] = self._prev_mean[1:]
-		actions = torch.empty(self.cfg.horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
+		actions = torch.empty(horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
 		if self.cfg.num_pi_trajs > 0:
 			actions[:, :self.cfg.num_pi_trajs] = pi_actions
 
@@ -174,7 +212,7 @@ class TDMPC2(torch.nn.Module):
 		for _ in range(self.cfg.iterations):
 
 			# Sample actions
-			r = torch.randn(self.cfg.horizon, self.cfg.num_samples-self.cfg.num_pi_trajs, self.cfg.action_dim, device=std.device)
+			r = torch.randn(horizon, self.cfg.num_samples-self.cfg.num_pi_trajs, self.cfg.action_dim, device=std.device)
 			actions_sample = mean.unsqueeze(1) + std.unsqueeze(1) * r
 			actions_sample = actions_sample.clamp(-1, 1)
 			actions[:, self.cfg.num_pi_trajs:] = actions_sample
@@ -206,7 +244,7 @@ class TDMPC2(torch.nn.Module):
 		self._prev_mean.copy_(mean)
 		return a.clamp(-1, 1)
 
-	def update_pi(self, zs, task):
+	def update_pi(self, zs, task, replay_action=None, horizon=None):
 		"""
 		Update policy using a sequence of latent states.
 
@@ -221,10 +259,16 @@ class TDMPC2(torch.nn.Module):
 		qs = self.model.Q(zs, action, task, return_type='avg', detach=True)
 		self.scale.update(qs[0])
 		qs = self.scale(qs)
+		horizon = len(qs) if horizon is None else horizon
+		action, qs = action[:horizon], qs[:horizon]
 
 		# Loss is a weighted sum of Q-values
 		rho = torch.pow(self.cfg.rho, torch.arange(len(qs), device=self.device))
-		pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho).mean()
+		pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"][:horizon] + qs).mean(dim=(1,2)) * rho).mean()
+		behavior_reg_loss = torch.zeros((), device=self.device)
+		if self.cfg.behavior_reg_coef > 0 and replay_action is not None:
+			behavior_reg_loss = F.mse_loss(info["mean"][:horizon], replay_action[:horizon])
+			pi_loss = pi_loss + self.cfg.behavior_reg_coef * behavior_reg_loss
 		pi_loss.backward()
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
 		self.pi_optim.step()
@@ -233,9 +277,10 @@ class TDMPC2(torch.nn.Module):
 		info = TensorDict({
 			"pi_loss": pi_loss,
 			"pi_grad_norm": pi_grad_norm,
-			"pi_entropy": info["entropy"],
-			"pi_scaled_entropy": info["scaled_entropy"],
+			"pi_entropy": info["entropy"][:horizon],
+			"pi_scaled_entropy": info["scaled_entropy"][:horizon],
 			"pi_scale": self.scale.value,
+			"behavior_reg_loss": behavior_reg_loss,
 		})
 		return info
 
@@ -257,6 +302,28 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)
 
+	@torch.no_grad()
+	def _estimate_depth_returns(self, zs, reward_preds, task):
+		"""Estimate returns from the same latent state at selected rollout depths."""
+		horizon = self._rollout_horizon
+		depths = tuple(dict.fromkeys(
+			depth for depth in (1, 3, 5, horizon)
+			if depth <= horizon
+		))
+		G = torch.zeros_like(reward_preds[0, :, :1])
+		discount = torch.ones_like(G)
+		discount_update = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
+		returns = {}
+		for t in range(horizon):
+			G = G + discount * math.two_hot_inv(reward_preds[t], self.cfg)
+			discount = discount * discount_update
+			depth = t + 1
+			if depth in depths:
+				bootstrap_action, _ = self.model.pi(zs[depth], task)
+				bootstrap_value = self.model.Q(zs[depth], bootstrap_action, task, return_type='avg', detach=True)
+				returns[depth] = G + discount * bootstrap_value
+		return returns
+
 	def _update(self, obs, action, reward, terminated, task=None):
 		# Compute targets
 		with torch.no_grad():
@@ -267,13 +334,14 @@ class TDMPC2(torch.nn.Module):
 		self.model.train()
 
 		# Latent rollout
-		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
+		horizon = self._rollout_horizon
+		zs = torch.empty(horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
 		z = self.model.encode(obs[0], task)
 		zs[0] = z
-		consistency_loss = 0
+		consistency_losses = []
 		for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
 			z = self.model.next(z, _action, task)
-			consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
+			consistency_losses.append(F.mse_loss(z, _next_z) * self.cfg.rho**t)
 			zs[t+1] = z
 
 		# Predictions
@@ -284,19 +352,26 @@ class TDMPC2(torch.nn.Module):
 			termination_pred = self.model.termination(zs[1:], task, unnormalized=True)
 
 		# Compute losses
-		reward_loss, value_loss = 0, 0
+		reward_losses, value_losses = [], []
 		for t, (rew_pred_unbind, rew_unbind, td_targets_unbind, qs_unbind) in enumerate(zip(reward_preds.unbind(0), reward.unbind(0), td_targets.unbind(0), qs.unbind(1))):
-			reward_loss = reward_loss + math.soft_ce(rew_pred_unbind, rew_unbind, self.cfg).mean() * self.cfg.rho**t
+			reward_losses.append(math.soft_ce(rew_pred_unbind, rew_unbind, self.cfg).mean() * self.cfg.rho**t)
+			value_loss = 0
 			for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
 				value_loss = value_loss + math.soft_ce(qs_unbind_unbind, td_targets_unbind, self.cfg).mean() * self.cfg.rho**t
+			value_losses.append(value_loss)
 
-		consistency_loss = consistency_loss / self.cfg.horizon
-		reward_loss = reward_loss / self.cfg.horizon
+		depth_returns = self._estimate_depth_returns(zs.detach(), reward_preds.detach(), task)
+		selected_horizon, inconsistency_stats = self._select_horizon(depth_returns)
+		consistency_loss = sum(consistency_losses[:selected_horizon]) / selected_horizon
+		reward_loss = sum(reward_losses[:selected_horizon]) / selected_horizon
 		if self.cfg.episodic:
-			termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
+			termination_loss = F.binary_cross_entropy_with_logits(
+				termination_pred[:selected_horizon],
+				terminated[:selected_horizon],
+			)
 		else:
 			termination_loss = 0.
-		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
+		value_loss = sum(value_losses[:selected_horizon]) / (selected_horizon * self.cfg.num_q)
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +
 			self.cfg.reward_coef * reward_loss +
@@ -311,21 +386,40 @@ class TDMPC2(torch.nn.Module):
 		self.optim.zero_grad(set_to_none=True)
 
 		# Update policy
-		pi_info = self.update_pi(zs.detach(), task)
+		pi_horizon = selected_horizon if self.cfg.adaptive_horizon else None
+		pi_info = self.update_pi(zs.detach(), task, replay_action=action, horizon=pi_horizon)
 
 		# Update target Q-functions
 		self.model.soft_update_target_Q()
 
 		# Return training statistics
 		self.model.eval()
+		q_values = math.two_hot_inv(qs, self.cfg)
+		depth_return_values = tuple(depth_returns.values())
+		return_mean = torch.stack(depth_return_values).mean(dim=0)
 		info = TensorDict({
+			"rollout_horizon": torch.tensor(float(selected_horizon), device=self.device),
+			"plan_rollout_horizon": self._last_plan_horizon,
+			"horizon_at_h_min": torch.tensor(float(selected_horizon == self.cfg.h_min), device=self.device),
+			"horizon_at_h_max": torch.tensor(float(selected_horizon == self.cfg.h_max), device=self.device),
 			"consistency_loss": consistency_loss,
 			"reward_loss": reward_loss,
 			"value_loss": value_loss,
+			"value_pred_mean": q_values.mean(),
+			"value_pred_std": q_values.std(unbiased=False),
+			"value_pred_min": q_values.min(),
+			"value_pred_max": q_values.max(),
+			"value_overestimation_proxy": q_values.mean() - depth_returns[horizon].mean(),
 			"termination_loss": termination_loss,
 			"total_loss": total_loss,
 			"grad_norm": grad_norm,
 		})
+		for depth, depth_return in depth_returns.items():
+			info[f"return_estimate_depth_{depth}"] = depth_return.mean()
+			info[f"model_value_inconsistency_depth_{depth}"] = inconsistency_stats.get(depth, (depth_return - return_mean).abs().mean())
+		info["return_estimate_depth_h"] = depth_returns[horizon].mean()
+		info["model_value_inconsistency_depth_h"] = inconsistency_stats.get(horizon, (depth_returns[horizon] - return_mean).abs().mean())
+		info["model_value_inconsistency"] = torch.stack(depth_return_values).std(dim=0, unbiased=False).mean()
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]))
 		info.update(pi_info)

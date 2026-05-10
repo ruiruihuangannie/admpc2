@@ -14,6 +14,7 @@ class OnlineTrainer(Trainer):
 		self._step = 0
 		self._ep_idx = 0
 		self._start_time = time()
+		self._best_eval_reward = -np.inf
 
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""
@@ -27,7 +28,7 @@ class OnlineTrainer(Trainer):
 
 	def eval(self):
 		"""Evaluate a TD-MPC2 agent."""
-		ep_rewards, ep_successes, ep_lengths = [], [], []
+		ep_rewards, ep_lengths = [], []
 		for i in range(self.cfg.eval_episodes):
 			obs, done, ep_reward, t = self.env.reset(), False, 0, 0
 			if self.cfg.save_video:
@@ -41,13 +42,11 @@ class OnlineTrainer(Trainer):
 				if self.cfg.save_video:
 					self.logger.video.record(self.env)
 			ep_rewards.append(ep_reward)
-			ep_successes.append(info['success'])
 			ep_lengths.append(t)
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
 		return dict(
 			episode_reward=np.nanmean(ep_rewards),
-			episode_success=np.nanmean(ep_successes),
 			episode_length= np.nanmean(ep_lengths),
 		)
 
@@ -83,6 +82,9 @@ class OnlineTrainer(Trainer):
 			if done:
 				if eval_next:
 					eval_metrics = self.eval()
+					if eval_metrics['episode_reward'] > self._best_eval_reward:
+						self._best_eval_reward = eval_metrics['episode_reward']
+						self.logger.save_agent(self.agent, identifier='best')
 					eval_metrics.update(self.common_metrics())
 					self.logger.log(eval_metrics, 'eval')
 					eval_next = False
@@ -93,7 +95,6 @@ class OnlineTrainer(Trainer):
 						'Set `episodic=true` to enable support for terminations.')
 					train_metrics.update(
 						episode_reward=torch.tensor([td['reward'] for td in self._tds[1:]]).sum(),
-						episode_success=info['success'],
 						episode_length=len(self._tds),
 						episode_terminated=info['terminated'])
 					train_metrics.update(self.common_metrics())

@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+    - /config@_global_
+    - _self_
+
+task: finger-spin
+obs: state
+model_size: 5
+exp_name: finger-spin-adaptive-only
+wandb_project: finger-spin
+wandb_run_name: adaptive-only
+
+adaptive_horizon: true
+horizon: 3
+h_min: 1
+h_max: 5
+inconsistency_threshold: 1.0
+inconsistency_patience: 1
+behavior_reg_coef: 0
+
+steps: 100000
+eval_freq: 10000
+eval_episodes: 5
+batch_size: 128
+num_samples: 256
+num_elites: 32
+num_pi_trajs: 12
+compile: false
+save_video: false
+save_agent: false
